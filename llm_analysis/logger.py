@@ -46,7 +46,7 @@ stdout_handler = logging.StreamHandler()
 stdout_handler.setFormatter(CustomFormatter(fmt))
 
 logger = logging.getLogger("__name__")
-logger.addHandler(stdout_handler)
+# logger.addHandler(stdout_handler)
 
 
 def get_current_level():

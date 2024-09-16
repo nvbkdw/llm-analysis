@@ -1,0 +1,11 @@
+{
+    "name": "b200_cx7",
+    "mem_per_GPU_in_GB": 192,
+    "hbm_bandwidth_in_GB_per_sec": 2000,
+    "intra_node_bandwidth_in_GB_per_sec": 800,
+    "intra_node_min_message_latency": 8e-06,
+    "peak_fp16_TFLOPS": 2250,
+    "peak_i8_TFLOPS": 4500,
+    "peak_i4_TFLOPS": 9000,
+    "inter_node_bandwidth_in_GB_per_sec": 45
+}
