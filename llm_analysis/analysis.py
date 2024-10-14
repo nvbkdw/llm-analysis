@@ -1347,7 +1347,15 @@ class LLMAnalysis:
 
         latency_fwd_per_layer_shared_dp_comm = self.get_latency_fwd_per_layer_shared_dp_comm()
 
-        latency_per_layer = latency_fwd_per_layer_attn + latency_fwd_per_layer_mlp + 2 * latency_fwd_per_layernorm + 2 * latency_fwd_per_tp_comm
+        comp_latency_per_layer = latency_fwd_per_layer_attn + latency_fwd_per_layer_mlp + 2 * latency_fwd_per_layernorm
+        tp_comm_latency_per_layer = 2 * latency_fwd_per_tp_comm 
+
+        # Non-overlapping TP communication and computation
+        latency_per_layer = comp_latency_per_layer + tp_comm_latency_per_layer
+
+        # Apply Async TP speed up with communication and computation overlap
+        AYNC_TP_SPEEDUP = os.environ.get('AYNC_TP_SPEEDUP', 0.3) # by default 30% speedup
+        latency_per_layer = latency_per_layer / (1 + AYNC_TP_SPEEDUP)
 
         if ds_zero > DSZeRO.STAGE_1 and latency_fwd_per_layer_shared_dp_comm > latency_per_layer:
             logger.warning(
@@ -1366,10 +1374,12 @@ class LLMAnalysis:
             f" {round(latency_fwd_per_layer_shared_dp_comm*1000, 3)}))")
 
         breakdown_per_layer = {
-            "attn": latency_fwd_per_layer_attn,
-            "mlp": latency_fwd_per_layer_mlp,
-            "layernorm": 2 * latency_fwd_per_layernorm,
-            "tp_comm": 2 * latency_fwd_per_tp_comm,
+            "comp_latency_per_layer": comp_latency_per_layer,
+            "tp_comm_latency_per_layer": tp_comm_latency_per_layer,
+            # "attn": latency_fwd_per_layer_attn,
+            # "mlp": latency_fwd_per_layer_mlp,
+            # "layernorm": 2 * latency_fwd_per_layernorm,
+            # "tp_comm": 2 * latency_fwd_per_tp_comm,
             "sharded_dp_comm": latency_fwd_per_layer_shared_dp_comm
         }
 
@@ -1457,14 +1467,15 @@ class LLMAnalysis:
 
         latency_fwd_layers = latency_fwd_per_layer * num_layers_per_gpu
 
-        latency_fwd_input_embedding = self.get_latency_fwd_input_embedding(
-            batch_size,
-            seq_len,
-            dtype_bytes=self.dtype_config.embedding_bits / BITS_PER_BYTE,
-        )
-
-        latency_fwd_output_embedding_loss = self.get_latency_fwd_output_embedding_loss(batch_size, seq_len)
-
+        # FIXME: ignored input and output embedding latency for now
+        latency_fwd_input_embedding = 0.0
+        latency_fwd_output_embedding_loss = 0.0 
+        # latency_fwd_input_embedding = self.get_latency_fwd_input_embedding(
+        #     batch_size,
+        #     seq_len,
+        #     dtype_bytes=self.dtype_config.embedding_bits / BITS_PER_BYTE,
+        # )
+        # latency_fwd_output_embedding_loss = self.get_latency_fwd_output_embedding_loss(batch_size, seq_len)
         latency_fwd = (latency_fwd_layers + latency_fwd_input_embedding + latency_fwd_output_embedding_loss)
 
         logger.info("latency_fwd_layers:"
@@ -1481,21 +1492,16 @@ class LLMAnalysis:
         )
 
         latency_fwd_breakdown = {
-            breakdown_prefix + "latency_fwd_attn":
-            breakdown_per_layer["attn"] * num_layers_per_gpu,
-            breakdown_prefix + "latency_fwd_mlp":
-            breakdown_per_layer["mlp"] * num_layers_per_gpu,
-            breakdown_prefix + "latency_fwd_layernorm":
-            breakdown_per_layer["layernorm"] * num_layers_per_gpu,
-            breakdown_prefix + "latency_fwd_tp_comm":
-            breakdown_per_layer["tp_comm"] * num_layers_per_gpu,
-            breakdown_prefix + "latency_fwd_sharded_dp_comm":
-            breakdown_per_layer["sharded_dp_comm"] * num_layers_per_gpu,
-            breakdown_prefix + "latency_fwd_input_embedding":
-            latency_fwd_input_embedding,
-            breakdown_prefix + "latency_fwd_output_embedding_loss":
-            latency_fwd_output_embedding_loss,
+            breakdown_prefix + "comp_latency_per_layer": breakdown_per_layer["comp_latency_per_layer"] * num_layers_per_gpu,
+            breakdown_prefix + "tp_comm_latency_per_layer": breakdown_per_layer["tp_comm_latency_per_layer"] * num_layers_per_gpu,
+            breakdown_prefix + "latency_fwd_sharded_dp_comm": breakdown_per_layer["sharded_dp_comm"] * num_layers_per_gpu,
+            breakdown_prefix + "latency_fwd_input_embedding": latency_fwd_input_embedding,
+            breakdown_prefix + "latency_fwd_output_embedding_loss": latency_fwd_output_embedding_loss,
         }
+
+        comp_ratio = latency_fwd_breakdown[breakdown_prefix + "comp_latency_per_layer"] / latency_fwd
+        latency_fwd_breakdown[breakdown_prefix + "comp_ratio"] = comp_ratio
+
         return latency_fwd, latency_fwd_breakdown
 
     def get_latency_weight_update(self, ):
@@ -2296,6 +2302,7 @@ class LLMAnalysis:
             layernorm_dtype_bytes=layernorm_dtype_bytes,
             ds_zero=ds_zero,
         )
+        latency_fwd_comp = latency_fwd_breakdown['comp_ratio'] * latency_fwd
 
         latency_fwd_per_layer_attn_compute = self.get_latency_fwd_per_layer_attn(
             batch_size_per_gpu, seq_len, False, activation_recomputation)
@@ -2330,16 +2337,15 @@ class LLMAnalysis:
 
         # FIXME: crude approximation, assuming BWD is 2x FWD
         latency_bwd = 2 * latency_fwd
+        latency_bwd_comp = 2 * latency_fwd_comp
         latency_per_micro_batch = latency_fwd + latency_bwd + latency_recompute
-        # FIXME: add a penalty for extra iterations, overhead per iteration.
-        # this is a pure guess, need to be calibrated
-        micro_batch_overhead = 0.0
-        latency_per_micro_batch = latency_per_micro_batch * (1 + micro_batch_overhead)
+        comp_ratio_per_micro_batch = (latency_fwd_comp + latency_bwd_comp) / latency_per_micro_batch 
+        recomp_ratio_per_micro_batch = latency_recompute / latency_per_micro_batch 
 
         latency_weight_update = self.get_latency_weight_update()
-        latency_per_iter = (
-            latency_per_micro_batch * gradient_accumulation_steps +
-            latency_weight_update)
+
+        # FIXME: consider Pipeline bubble here
+        latency_per_iter = ( latency_per_micro_batch * gradient_accumulation_steps + latency_weight_update)
 
         logger.info(
             f"latency_per_micro_batch: {round(latency_per_micro_batch * 1000, 3)} ms ({round(latency_fwd * 1000, 3)} latency_fwd * 3 + {round(latency_recompute * 1000, 3)} latency_recompute)"
@@ -2370,11 +2376,6 @@ class LLMAnalysis:
         # total_training_latency = latency_per_iter * num_iters
         total_training_latency = latency_per_iter * num_iters
         total_training_latency_using_flops = latency_per_iter_using_flops * num_iters
-        logger.info(
-            f"total_training_latency: {round(total_training_latency, 3)} s"
-            f" = {round(total_training_latency/3600/24, 3)} days"
-            f" ({round(latency_per_iter * 1000, 3)} ms x"
-            f" {num_iters} iters)")
         
         device_tokens_per_sec = round(
             (seq_len * batch_size_per_gpu * gradient_accumulation_steps) / latency_per_iter / (self.parallelism_config.tp_size * self.parallelism_config.pp_size), 4)
@@ -2397,6 +2398,22 @@ class LLMAnalysis:
                      3600 if total_training_latency is not None else None)
 
         summary_dict = {
+            "MFU": latency_per_iter_using_flops/latency_per_iter,
+            "compute_ratio_per_micro_batch": comp_ratio_per_micro_batch,
+            "recompute_ratio_per_micro_batch": recomp_ratio_per_micro_batch,
+            'latency_per_micro_batch': round(latency_per_micro_batch, 2),
+            'gradient_accumulation_steps': gradient_accumulation_steps,
+            'latency_fwd': round(latency_fwd, 2),
+            # 'latency_bwd': latency_bwd,
+            # 'latency_recompute': latency_recompute,
+        }
+        summary_dict.update(latency_fwd_breakdown)
+        summary_dict.update({
+            f"{k}_ratio": round(v / latency_fwd, 4) for k, v in latency_fwd_breakdown.items()    
+        })
+
+
+        summary_dict.update({
             "total_training_days": total_training_latency/3600/24,
             "batch_size_per_gpu":
             batch_size_per_gpu,
@@ -2521,9 +2538,6 @@ class LLMAnalysis:
             latency_recompute,
             "num_iters":
             num_iters,
-        }
-        summary_dict.update(latency_fwd_breakdown)
-        summary_dict.update({
             "latency_per_iter": latency_per_iter,
             "device_tokens_per_sec": device_tokens_per_sec,
             "total_training_latency": total_training_latency,
